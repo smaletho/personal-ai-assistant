@@ -1,0 +1,27 @@
+{
+  "name": "ai-calendar-assistant-backend",
+  "version": "1.0.0",
+  "description": "AI Calendar Assistant Backend API",
+  "main": "main.py",
+  "scripts": {
+    "start": "uvicorn main:app --reload",
+    "test": "pytest"
+  },
+  "keywords": [
+    "ai",
+    "calendar",
+    "assistant",
+    "api",
+    "fastapi"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "fastapi": "^0.100.0",
+    "uvicorn": "^0.23.0",
+    "websockets": "^11.0.3"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

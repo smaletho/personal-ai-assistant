@@ -1,0 +1,469 @@
+"""
+Chat API routes.
+"""
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Query, status
+from typing import Optional, Dict, Any
+import json
+import uuid
+import datetime
+import time
+import asyncio
+import jwt
+import logging
+
+from backend.services.agent_service import AgentCalendarAssistant
+from backend.config.auth_config import get_google_oauth_settings
+from backend.models.database import get_db, SessionLocal
+from backend.models.user import User
+from backend.utils.connection_manager import ConnectionManager
+from backend.utils.websocket_session import WebSocketSessionState
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/chat",
+    tags=["chat"],
+    responses={404: {"description": "Not found"}},
+)
+    
+# Create a connection manager instance
+manager = ConnectionManager()
+        """Connect a client and create an agent instance if needed."""
+        # Track connection attempts for this session
+        current_time = time.time()
+        if session_id in self.connection_attempts:
+            self.connection_attempts[session_id] += 1
+            
+            # Check if we're reconnecting too quickly (potential loop)
+            if session_id in self.last_disconnect_time:
+                time_since_disconnect = current_time - self.last_disconnect_time[session_id]
+                print(f"[DEBUG] Reconnection attempt for {session_id[:8]} after {time_since_disconnect:.2f}s (attempt {self.connection_attempts[session_id]})")
+                
+                # Implement progressive backoff to prevent connection cycling
+                # As attempts increase, required wait time increases
+                required_wait_time = min(0.5 * (2 ** min(self.connection_attempts[session_id] - 1, 5)), 30)
+                
+                if time_since_disconnect < required_wait_time and self.connection_attempts[session_id] > 3:
+                    # Connection is cycling too rapidly, reject with detailed information
+                    print(f"[DEBUG] Connection cycling detected for {session_id[:8]}, required wait: {required_wait_time:.2f}s")
+                    await websocket.close(code=1013, reason=f"Reconnecting too quickly. Please wait at least {required_wait_time:.1f} seconds between reconnection attempts.")
+                    return False
+        else:
+            self.connection_attempts[session_id] = 1
+            print(f"[DEBUG] First connection attempt for session {session_id[:8]}")
+            
+        # Check if a connection for this session already exists
+        if session_id in self.active_connections:
+            # Existing connection found - close the old one gracefully
+            try:
+                await self.active_connections[session_id].send_json({
+                    "type": "system",
+                    "content": "Your session has been connected from another client. This connection will close."
+                })
+                await self.active_connections[session_id].close(code=1000, reason="Replaced by newer connection")
+            except Exception as e:
+                print(f"[DEBUG] Error closing existing connection: {e}")
+        
+        # Accept the connection
+        await websocket.accept()
+        self.active_connections[session_id] = websocket
+        
+        # Create or update session state with connection time for tracking
+        current_time = datetime.datetime.now().isoformat()
+        current_timestamp = time.time()
+        
+        if session_id not in self.session_states:
+            # Create new session state
+            self.session_states[session_id] = {
+                "session_id": session_id,
+                "created_at": current_time,
+                "last_active": current_time,
+                "connected_at": current_timestamp,  # Add timestamp for duration tracking
+                "message_count": 0
+            }
+            print(f"[DEBUG] New session created for {session_id[:8]}")
+        else:
+            # Update existing session state
+            self.session_states[session_id]["last_active"] = current_time
+            self.session_states[session_id]["connected_at"] = current_timestamp
+            print(f"[DEBUG] Existing session updated for {session_id[:8]}")
+            
+        # Create a minimal agent instance if it doesn't exist
+        # A fully authenticated agent will be created after authentication message is received
+        if session_id not in self.agent_instances:
+            try:
+                print(f"[DEBUG] Initializing new minimal agent for session {session_id[:8]}...")
+                # Create a basic agent instance without authentication
+                # This will be replaced after successful authentication
+                self.agent_instances[session_id] = AgentCalendarAssistant()
+                
+                # Confirm successful initialization to the client
+                await self.send_message(session_id, {
+                    "type": "system",
+                    "content": "Connected to assistant. Please wait for authentication..."
+                })
+            except Exception as e:
+                print(f"[ERROR] Error initializing agent for session {session_id[:8]}: {str(e)}")
+                # Send error to client
+                await self.send_message(session_id, {
+                    "type": "error",
+                    "content": f"Error initializing agent: {str(e)}"
+                })
+        else:
+            print(f"[DEBUG] Using existing agent for session {session_id[:8]}")
+            # Notify client about the reconnection
+            await self.send_message(session_id, {
+                "type": "system",
+                "content": "Reconnected to assistant. Restoring session..."
+            })
+                
+        return True
+                
+    async def disconnect(self, session_id: str):
+        """Disconnect a client and clean up."""
+        # Track disconnect time for reconnection rate limiting
+        self.last_disconnect_time[session_id] = time.time()
+        
+        # Update session state with disconnection time
+        if session_id in self.session_states:
+            self.session_states[session_id]["last_disconnect"] = datetime.datetime.now().isoformat()
+            
+            # Calculate connection duration
+            if "connected_at" in self.session_states[session_id]:
+                connected_at = self.session_states[session_id]["connected_at"]
+                if isinstance(connected_at, str):
+                    try:
+                        connected_dt = datetime.datetime.fromisoformat(connected_at)
+                        now = datetime.datetime.now()
+                        duration_seconds = (now - connected_dt).total_seconds()
+                        print(f"[DEBUG] Session {session_id[:8]} disconnected after {duration_seconds:.2f}s")
+                        
+                        # If connection was stable for at least 10 seconds, reset the counter
+                        # Use a longer duration to ensure stability before resetting
+                        if duration_seconds >= 10.0:
+                            print(f"[DEBUG] Resetting connection attempts for {session_id[:8]} - connection was stable")
+                            self.connection_attempts[session_id] = 0
+                    except Exception as e:
+                        print(f"[WARNING] Error calculating session duration: {e}")
+        
+        # Clean up active connections
+        if session_id in self.active_connections:
+            print(f"[DEBUG] Disconnecting session {session_id[:8]}")
+            del self.active_connections[session_id]
+            
+        # Cancel any typing indicators
+        if session_id in self.typing_tasks:
+            try:
+                self.typing_tasks[session_id].cancel()
+                del self.typing_tasks[session_id]
+            except Exception as e:
+                print(f"[WARNING] Error cancelling typing task: {e}")
+    
+    def get_agent(self, session_id: str) -> Optional[AgentCalendarAssistant]:
+        """Get the agent instance for a session."""
+        return self.agent_instances.get(session_id)
+    
+    async def send_message(self, session_id: str, data: Dict):
+        """Send a message to a specific session."""
+        if session_id in self.active_connections:
+            await self.active_connections[session_id].send_json(data)
+    
+    async def send_typing_indicator(self, session_id: str, duration: int = 2):
+        """Send a typing indicator to the client that lasts for the specified duration."""
+        if session_id in self.active_connections:
+            # Start typing
+            await self.send_message(session_id, {"type": "typing", "content": True})
+            
+            try:
+                # Wait for the specified duration
+                await asyncio.sleep(duration)
+            finally:
+                # Stop typing (even if canceled)
+                if session_id in self.active_connections:
+                    await self.send_message(session_id, {"type": "typing", "content": False})
+    
+    def start_typing_indicator(self, session_id: str, duration: int = 2):
+        """Start a typing indicator as a background task."""
+        if session_id in self.typing_tasks and not self.typing_tasks[session_id].done():
+            self.typing_tasks[session_id].cancel()
+            
+        self.typing_tasks[session_id] = asyncio.create_task(
+            self.send_typing_indicator(session_id, duration)
+        )
+        
+    def update_session_state(self, session_id: str, increment_message_count: bool = True):
+        """Update the session state's last active time and message count."""
+        if session_id in self.session_states:
+            self.session_states[session_id]["last_active"] = datetime.datetime.now().isoformat()
+            if increment_message_count:
+                self.session_states[session_id]["message_count"] += 1
+
+# Create a connection manager instance
+manager = ConnectionManager()
+
+
+async def verify_token(token: str, session_id: str) -> Optional[User]:
+    """
+    Verify the JWT token and return the user if valid.
+    
+    Args:
+        token: The JWT token to verify
+        session_id: The session ID for logging purposes
+        
+    Returns:
+        User object if token is valid, None otherwise
+    """
+    try:
+        # Get settings for JWT configuration
+        settings = get_google_oauth_settings()
+        
+        # Decode the token
+        payload = jwt.decode(
+            token, 
+            settings.JWT_SECRET, 
+            algorithms=[settings.JWT_ALGORITHM]
+        )
+        
+        # Extract user email
+        email = payload.get("sub")
+        if not email:
+            print(f"[ERROR] Token for session {session_id[:8]} missing 'sub' claim")
+            return None
+        
+        # Check token expiration
+        exp = payload.get("exp")
+        if not exp or exp < time.time():
+            print(f"[ERROR] Token for session {session_id[:8]} has expired")
+            return None
+            
+        # Get user from database
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.email == email).first()
+            if not user:
+                print(f"[ERROR] User not found for email: {email}")
+                return None
+            
+            print(f"[DEBUG] Successfully verified token for user: {email} in session {session_id[:8]}")
+            return user
+        finally:
+            db.close()
+            
+    except jwt.PyJWTError as e:
+        print(f"[ERROR] Invalid token for session {session_id[:8]}: {str(e)}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] Error verifying token for session {session_id[:8]}: {str(e)}")
+        return None
+
+@router.post("/")
+async def process_message(message: str, session_id: Optional[str] = None):
+    """Process a chat message and return the response."""
+    if not session_id:
+        session_id = str(uuid.uuid4())
+    
+    # Get or create agent
+    agent = manager.get_agent(session_id)
+    if not agent:
+        try:
+            agent = AgentCalendarAssistant()
+            manager.agent_instances[session_id] = agent
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to initialize agent: {str(e)}")
+    
+    # Process message
+    try:
+        response = agent.process_input(message)
+        return {
+            "response": response,
+            "session_id": session_id
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
+
+@router.websocket("/ws/{session_id}")
+async def websocket_endpoint(
+    websocket: WebSocket, 
+    session_id: str
+):
+    """WebSocket endpoint for real-time chat with the agent."""
+    # Removed user email query parameter for security reasons
+    # Will get user information from authentication message instead
+    print(f"[DEBUG] WebSocket connection request for session {session_id[:8]}...")
+    
+    # If this is a new connection request, log some details
+    connection_count = len(manager.active_connections)
+    print(f"[DEBUG] Current active connections before accepting new connection: {connection_count}")
+    
+    # Connect without user authentication first - will authenticate via message
+    success = await manager.connect(websocket, session_id)
+    if not success:
+        return
+    
+    try:
+        while True:
+            # Receive message from client
+            data = await websocket.receive_text()
+            
+            try:
+                # Parse the message
+                try:
+                    message_data = json.loads(data)
+                    message_type = message_data.get("type", "message")
+                    
+                    # Handle authentication message
+                    if message_type == "authentication":
+                        # Process authentication token
+                        token = message_data.get("token")
+                        email = message_data.get("email")
+                        
+                        if not token:
+                            await manager.send_message(session_id, {
+                                "type": "error",
+                                "content": "Authentication failed: No token provided"
+                            })
+                            continue
+                            
+                        # Verify the token and get user
+                        user = await verify_token(token, session_id)
+                        
+                        if user:
+                            print(f"[DEBUG] User authenticated for session {session_id[:8]}: {user.email}")
+                            # Store authenticated user with the session
+                            manager.authenticated_users[session_id] = user
+                            
+                            # Initialize agent with authenticated user
+                            try:
+                                # Create a database session for this agent initialization
+                                db = SessionLocal()
+                                try:
+                                    # Create a new agent with authenticated user
+                                    print(f"[DEBUG] Initializing agent for authenticated user: {user.email}")
+                                    
+                                    # First validate that we can create a calendar manager
+                                    try:
+                                        from backend.services.auth_service import direct_get_calendar_manager
+                                        calendar_manager = direct_get_calendar_manager(user=user, db=db)
+                                        if calendar_manager is None:
+                                            raise ValueError("Failed to create calendar manager")
+                                        print(f"[DEBUG] Successfully created calendar manager for {user.email}")
+                                    except Exception as cal_err:
+                                        print(f"[ERROR] Failed to create calendar manager: {str(cal_err)}")
+                                        raise ValueError(f"Calendar authentication error: {str(cal_err)}")
+                                        
+                                    # Now create the agent with verified authentication
+                                    manager.agent_instances[session_id] = AgentCalendarAssistant(user=user, db=db)
+                                    manager.authenticated_users[session_id] = user
+                                    
+                                    await manager.send_message(session_id, {
+                                        "type": "system",
+                                        "content": "Authentication successful"
+                                    })
+                                except Exception as e:
+                                    print(f"[ERROR] Failed to initialize agent with authenticated user: {str(e)}")
+                                    await manager.send_message(session_id, {
+                                        "type": "error",
+                                        "content": f"Failed to initialize agent: {str(e)}"
+                                    })
+                                finally:
+                                    # Close the database session
+                                    db.close()
+                            except Exception as e:
+                                print(f"[ERROR] Failed to initialize agent with authenticated user: {str(e)}")
+                                await manager.send_message(session_id, {
+                                    "type": "error",
+                                    "content": f"Failed to initialize agent: {str(e)}"
+                                })
+                            finally:
+                                # Close the database session
+                                db.close()
+                        else:
+                            await manager.send_message(session_id, {
+                                "type": "error",
+                                "content": "Authentication failed: Invalid token"
+                            })
+                        continue
+                        
+                    # For regular messages, get the agent
+                    agent = manager.get_agent(session_id)
+                    if not agent:
+                        # Check if we have user authentication but agent failed to initialize
+                        if session_id in manager.authenticated_users:
+                            user = manager.authenticated_users[session_id]
+                            db = SessionLocal()
+                            try:
+                                print(f"[DEBUG] Attempting to reinitialize agent for session {session_id[:8]}")
+                                manager.agent_instances[session_id] = AgentCalendarAssistant(user=user, db=db)
+                                agent = manager.agent_instances[session_id]
+                                await manager.send_message(session_id, {
+                                    "type": "system",
+                                    "content": "Agent reinitialized successfully"
+                                })
+                            except Exception as e:
+                                print(f"[ERROR] Failed to reinitialize agent: {str(e)}")
+                                await manager.send_message(session_id, {
+                                    "type": "error",
+                                    "content": "Agent not initialized. Please try refreshing the page."
+                                })
+                                db.close()
+                                continue
+                            finally:
+                                db.close()
+                        else:
+                            await manager.send_message(session_id, {
+                                "type": "error",
+                                "content": "Agent not initialized. Please try refreshing the page and authenticate again."
+                            })
+                            continue
+                    
+                    # For regular message processing
+                    user_message = message_data.get("content", "")
+                    message_id = message_data.get("message_id", str(uuid.uuid4()))
+                except json.JSONDecodeError:
+                    # If not valid JSON, treat the entire data as the message
+                    user_message = data
+                    message_id = str(uuid.uuid4())
+                    message_type = "message"
+                
+                # Skip processing for non-message types that we've already handled
+                if message_type != "message":
+                    continue
+                
+                # Parse the message
+                try:
+                    message_data = json.loads(data)
+                    user_message = message_data.get("content", "")
+                    message_id = message_data.get("message_id", str(uuid.uuid4()))
+                except json.JSONDecodeError:
+                    # If not valid JSON, treat the entire data as the message
+                    user_message = data
+                    message_id = str(uuid.uuid4())
+                
+                # Update session state
+                manager.update_session_state(session_id)
+                
+                # Start typing indicator
+                manager.start_typing_indicator(session_id, duration=3)
+                
+                # Process the message (this is where our agent takes time to respond)
+                response = agent.process_input(user_message)
+                
+                # Send response back to client
+                await manager.send_message(session_id, {
+                    "type": "message",
+                    "content": response,
+                    "message_id": message_id,
+                    "role": "assistant",
+                    "timestamp": datetime.datetime.now().isoformat()
+                })
+            except Exception as e:
+                await manager.send_message(session_id, {
+                    "type": "error",
+                    "content": f"Error processing message: {str(e)}",
+                    "message_id": str(uuid.uuid4())
+                })
+    except WebSocketDisconnect:
+        manager.disconnect(session_id)
+    except Exception as e:
+        manager.disconnect(session_id)
